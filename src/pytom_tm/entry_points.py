@@ -1,10 +1,18 @@
+# 导入 argparse 模块，用于解析命令行参数
 import argparse
+# 导入 sys 模块，用于与 Python 解释器进行交互
 import sys
+# 导入 pathlib 模块，用于处理文件路径
 import pathlib
+# 导入 logging 模块，用于记录日志信息
 import logging
+# 导入 numpy 库，用于进行数值计算
 import numpy as np
+# 导入 starfile 库，用于处理 STAR 文件
 import starfile
+# 从 pytom_tm.extract 模块导入 extract_particles 函数
 from pytom_tm.extract import extract_particles
+# 从 pytom_tm.io 模块导入一系列工具和验证类
 from pytom_tm.io import (
     LargerThanZero,
     write_mrc,
@@ -21,30 +29,52 @@ from pytom_tm.io import (
     ParseGPUIndices,
     parse_relion5_star_data,
 )
+# 从 pytom_tm.tmjob 模块导入 load_json_to_tmjob 函数
 from pytom_tm.tmjob import load_json_to_tmjob
+# 从 os 模块导入 urandom 函数，用于生成随机字节
 from os import urandom
 
 
 def _parse_argv(argv=None):
+    """
+    解析命令行参数。
+
+    如果未提供参数，则使用 sys.argv[1:] 获取命令行参数。
+
+    参数:
+    argv (list): 命令行参数列表，默认为 None。
+
+    返回:
+    list: 解析后的命令行参数列表。
+    """
     if argv is None:
         return sys.argv[1:]
     return argv
 
 
 def pytom_create_mask(argv=None):
+    """
+    创建模板匹配所需的掩码。
+
+    支持创建球形或椭球形掩码，并将其保存为 MRC 文件。
+
+    参数:
+    argv (list): 命令行参数列表，默认为 None。
+    """
     from pytom_tm.mask import spherical_mask, ellipsoidal_mask
 
     argv = _parse_argv(argv)
 
-    # entry_point strings cannot use '\n' characters as this will break the website
-    # snippet that displays the CLI help message
+    # entry_point 字符串不能使用 '\n' 字符，因为这会破坏网站上显示 CLI 帮助信息的代码片段
     # ---8<--- [start:create_mask_usage]
 
+    # 创建命令行参数解析器
     parser = argparse.ArgumentParser(
         prog="pytom_create_mask.py",
         description="Create a mask for template matching. "
         "-- Marten Chaillet (@McHaillet)",
     )
+    # 添加 -b/--box-size 参数，指定掩码的方形盒子大小
     parser.add_argument(
         "-b",
         "--box-size",
@@ -53,6 +83,7 @@ def pytom_create_mask(argv=None):
         action=LargerThanZero,
         help="Shape of square box for the mask.",
     )
+    # 添加 -o/--output-file 参数，指定输出文件的路径
     parser.add_argument(
         "-o",
         "--output-file",
@@ -62,6 +93,7 @@ def pytom_create_mask(argv=None):
         "If not provided file is written to current directory in the following format: "
         "./mask_b[box_size]px_r[radius]px.mrc ",
     )
+    # 添加 --voxel-size 参数，指定体素大小
     parser.add_argument(
         "--voxel-size",
         type=float,
@@ -71,6 +103,7 @@ def pytom_create_mask(argv=None):
         help="Provide a voxel size to annotate the MRC (currently not used for any "
         "mask calculation).",
     )
+    # 添加 -r/--radius 参数，指定球形或椭球形掩码的半径
     parser.add_argument(
         "-r",
         "--radius",
@@ -81,6 +114,7 @@ def pytom_create_mask(argv=None):
         "minor2 are provided, this will be the radius of the ellipsoidal mask along "
         "the x-axis.",
     )
+    # 添加 --radius-minor1 参数，指定椭球形掩码在 y 轴上的半径
     parser.add_argument(
         "--radius-minor1",
         type=float,
@@ -88,6 +122,7 @@ def pytom_create_mask(argv=None):
         action=LargerThanZero,
         help="Radius of the ellipsoidal mask along the y-axis in number of pixels.",
     )
+    # 添加 --radius-minor2 参数，指定椭球形掩码在 z 轴上的半径
     parser.add_argument(
         "--radius-minor2",
         type=float,
@@ -95,6 +130,7 @@ def pytom_create_mask(argv=None):
         action=LargerThanZero,
         help="Radius of the ellipsoidal mask along the z-axis in number of pixels.",
     )
+    # 添加 -s/--sigma 参数，指定掩码边缘高斯衰减的标准差
     parser.add_argument(
         "-s",
         "--sigma",
@@ -109,10 +145,12 @@ def pytom_create_mask(argv=None):
     # ---8<--- [end:create_mask_usage]
 
     argv = _parse_argv(argv)
+    # 解析命令行参数
     args = parser.parse_args(argv)
 
-    # generate mask
+    # 生成掩码
     if args.radius_minor1 is not None and args.radius_minor2 is not None:
+        # 如果提供了 y 轴和 z 轴的半径，则生成椭球形掩码
         mask = ellipsoidal_mask(
             args.box_size,
             args.radius,
@@ -121,31 +159,42 @@ def pytom_create_mask(argv=None):
             smooth=args.sigma,
         )
     else:
+        # 否则生成球形掩码
         mask = spherical_mask(args.box_size, args.radius, smooth=args.sigma)
 
-    # write to disk
+    # 写入磁盘
     output_path = (
         args.output_file
         if args.output_file is not None
         else (pathlib.Path(f"mask_b{args.box_size}px_r{args.radius}px.mrc"))
     )
+    # 将掩码保存为 MRC 文件
     write_mrc(output_path, mask, args.voxel_size)
 
 
 def pytom_create_template(argv=None):
+    """
+    从 MRC 密度图生成模板。
+
+    支持对输入图进行下采样、低通滤波、居中处理等操作。
+
+    参数:
+    argv (list): 命令行参数列表，默认为 None。
+    """
     from pytom_tm.template import generate_template_from_map
 
     argv = _parse_argv(argv)
 
-    # entry_point strings cannot use '\n' characters as this will break the website
-    # snippet that displays the CLI help message
+    # entry_point 字符串不能使用 '\n' 字符，因为这会破坏网站上显示 CLI 帮助信息的代码片段
     # ---8<--- [start:create_template_usage]
 
+    # 创建命令行参数解析器
     parser = argparse.ArgumentParser(
         prog="pytom_create_template.py",
         description="Generate template from MRC density. "
         "-- Marten Chaillet (@McHaillet)",
     )
+    # 添加 -i/--input-map 参数，指定输入的 MRC 密度图文件路径
     parser.add_argument(
         "-i",
         "--input-map",
@@ -154,6 +203,7 @@ def pytom_create_template(argv=None):
         action=CheckFileExists,
         help="Map to generate template from; MRC file.",
     )
+    # 添加 -o/--output-file 参数，指定输出文件的路径
     parser.add_argument(
         "-o",
         "--output-file",
@@ -163,6 +213,7 @@ def pytom_create_template(argv=None):
         "file is written to current directory in the following format: "
         "template_{input_map.stem}_{voxel_size}A.mrc",
     )
+    # 添加 --input-voxel-size-angstrom 参数，指定输入图的体素大小
     parser.add_argument(
         "--input-voxel-size-angstrom",
         type=float,
@@ -171,6 +222,7 @@ def pytom_create_template(argv=None):
         help="Voxel size of input map, in Angstrom. If not provided will be read from "
         "MRC input (so make sure it is annotated correctly!).",
     )
+    # 添加 --output-voxel-size-angstrom 参数，指定输出模板的体素大小
     parser.add_argument(
         "--output-voxel-size-angstrom",
         type=float,
@@ -180,6 +232,7 @@ def pytom_create_template(argv=None):
         "voxel size of the tomograms for template matching. Input map will be "
         "downsampled to this spacing.",
     )
+    # 添加 --center 参数，指定是否自动将密度图居中
     parser.add_argument(
         "--center",
         action="store_true",
@@ -188,6 +241,7 @@ def pytom_create_template(argv=None):
         help="Set this flag to automatically center the density in the volume by "
         "measuring the center of mass.",
     )
+    # 添加 --low-pass 参数，指定低通滤波器的分辨率
     parser.add_argument(
         "--low-pass",
         type=float,
@@ -197,6 +251,7 @@ def pytom_create_template(argv=None):
         "low pass filter is applied to a resolution of (2 * output_spacing_angstrom) "
         "before downsampling the input volume.",
     )
+    # 添加 -b/--box-size 参数，指定输出模板的盒子大小
     parser.add_argument(
         "-b",
         "--box-size",
@@ -206,6 +261,7 @@ def pytom_create_template(argv=None):
         help="Specify a desired size for the output box of the template. "
         "Only works if it is larger than the downsampled box size of the input.",
     )
+    # 添加 --invert 参数，指定是否将模板乘以 -1
     parser.add_argument(
         "--invert",
         action="store_true",
@@ -214,6 +270,7 @@ def pytom_create_template(argv=None):
         help="Multiply template by -1. "
         "WARNING: not needed if ctf with defocus is already applied!",
     )
+    # 添加 -m/--mirror 参数，指定是否在写入磁盘前镜像模板
     parser.add_argument(
         "-m",
         "--mirror",
@@ -222,6 +279,7 @@ def pytom_create_template(argv=None):
         required=False,
         help="Mirror the final template before writing to disk.",
     )
+    # 添加 --log 参数，指定日志级别
     parser.add_argument(
         "--log",
         type=str,
@@ -233,11 +291,12 @@ def pytom_create_template(argv=None):
 
     # ---8<--- [end:create_template_usage]
 
+    # 解析命令行参数
     args = parser.parse_args(argv)
+    # 配置日志记录
     logging.basicConfig(level=args.log, force=True)
 
-    # set input voxel size and give user warning if it does not match
-    # with MRC annotation
+    # 设置输入体素大小，并在不匹配时给用户警告
     input_data = read_mrc(args.input_map)
     input_meta_data = read_mrc_meta_data(args.input_map)
     if args.input_voxel_size_angstrom is not None:
@@ -251,7 +310,7 @@ def pytom_create_template(argv=None):
     else:
         map_spacing_angstrom = input_meta_data["voxel_size"]
 
-    # set output path
+    # 设置输出路径
     output_path = (
         args.output_file
         if args.output_file is not None
@@ -268,6 +327,7 @@ def pytom_create_template(argv=None):
             "template."
         )
 
+    # 生成模板
     template = generate_template_from_map(
         input_data,
         map_spacing_angstrom,
@@ -279,6 +339,7 @@ def pytom_create_template(argv=None):
 
     logging.debug(f"shape of template after processing is: {template.shape}")
 
+    # 将模板保存为 MRC 文件
     write_mrc(
         output_path,
         np.flip(template, axis=0) if args.mirror else template,
@@ -287,18 +348,25 @@ def pytom_create_template(argv=None):
 
 
 def estimate_roc(argv=None):
+    """
+    从 TMJob 文件估计 ROC 曲线。
+
+    参数:
+    argv (list): 命令行参数列表，默认为 None。
+    """
     argv = _parse_argv(argv)
     from pytom_tm.plotting import plist_quality_gaussian_fit
 
-    # entry_point strings cannot use '\n' characters as this will break the website
-    # snippet that displays the CLI help message
+    # entry_point 字符串不能使用 '\n' 字符，因为这会破坏网站上显示 CLI 帮助信息的代码片段
     # ---8<--- [start:estimate_roc_usage]
 
+    # 创建命令行参数解析器
     parser = argparse.ArgumentParser(
         prog="pytom_estimate_roc.py",
         description="Estimate ROC curve from TMJob file. "
         "-- Marten Chaillet (@McHaillet)",
     )
+    # 添加 -j/--job-file 参数，指定包含模板匹配作业数据的 JSON 文件路径
     parser.add_argument(
         "-j",
         "--job-file",
@@ -308,6 +376,7 @@ def estimate_roc(argv=None):
         help="JSON file that contain all data on the template matching job, written "
         "out by pytom_match_template.py in the destination path.",
     )
+    # 添加 -n/--number-of-particles 参数，指定要提取的粒子数量
     parser.add_argument(
         "-n",
         "--number-of-particles",
@@ -317,6 +386,7 @@ def estimate_roc(argv=None):
         help="The number of particles to extract and estimate the ROC on, recommended "
         "is to multiply the expected number of particles by 3.",
     )
+    # 添加 --particle-diameter 参数，指定模板的粒子直径
     parser.add_argument(
         "--particle-diameter",
         type=float,
@@ -332,6 +402,7 @@ def estimate_roc(argv=None):
         "determined using its long axis but the extraction mask should use its "
         "short axis.",
     )
+    # 添加 --bins 参数，指定直方图的箱数
     parser.add_argument(
         "--bins",
         type=int,
@@ -340,6 +411,7 @@ def estimate_roc(argv=None):
         default=20,
         help="Number of bins for the histogram to fit Gaussians on.",
     )
+    # 添加 --gaussian-peak 参数，指定高斯拟合的直方图峰值的预期索引
     parser.add_argument(
         "--gaussian-peak",
         type=int,
@@ -348,6 +420,7 @@ def estimate_roc(argv=None):
         help="Expected index of the histogram peak of the Gaussian fitted to the "
         "particle population.",
     )
+    # 添加 --force-peak 参数，指定是否强制粒子峰值到指定的索引
     parser.add_argument(
         "--force-peak",
         action="store_true",
@@ -355,6 +428,7 @@ def estimate_roc(argv=None):
         required=False,
         help="Force the particle peak to the provided peak index.",
     )
+    # 添加 --crop-plot 参数，指定是否裁剪相对于粒子总体高度的图
     parser.add_argument(
         "--crop-plot",
         action="store_true",
@@ -362,6 +436,7 @@ def estimate_roc(argv=None):
         required=False,
         help="Flag to crop the plot relative to the height of the particle population.",
     )
+    # 添加 --show-plot 参数，指定是否使用弹出窗口显示图
     parser.add_argument(
         "--show-plot",
         action="store_true",
@@ -370,6 +445,7 @@ def estimate_roc(argv=None):
         help="Flag to use a pop-up window for the plot instead of writing it to the "
         "location of the job file.",
     )
+    # 添加 --log 参数，指定日志级别
     parser.add_argument(
         "--log",
         type=str,
@@ -378,6 +454,7 @@ def estimate_roc(argv=None):
         action=ParseLogging,
         help="Can be set to `info` or `debug`",
     )
+    # 添加 --ignore_tomogram_mask 参数，指定是否忽略 TM 作业的断层图像掩码
     parser.add_argument(
         "--ignore_tomogram_mask",
         action="store_true",
@@ -389,11 +466,14 @@ def estimate_roc(argv=None):
 
     # ---8<--- [end:estimate_roc_usage]
 
+    # 解析命令行参数
     args = parser.parse_args(argv)
+    # 配置日志记录
     logging.basicConfig(level=args.log, force=True)
 
+    # 加载模板匹配作业
     template_matching_job = load_json_to_tmjob(args.job_file)
-    # Set cut off to -1 to ensure the number of particles gets extracted
+    # 设置截止值为 -1 以确保提取指定数量的粒子
     _, lcc_max_values = extract_particles(
         template_matching_job,
         args.number_of_particles,
@@ -403,12 +483,14 @@ def estimate_roc(argv=None):
         ignore_tomogram_mask=args.ignore_tomogram_mask,
     )
 
+    # 读取分数体积
     score_volume = read_mrc(
         template_matching_job.output_dir.joinpath(
             f"{template_matching_job.tomo_id}_scores.mrc"
         )
     )
 
+    # 绘制 ROC 曲线
     plist_quality_gaussian_fit(
         lcc_max_values,
         score_volume,
@@ -428,16 +510,23 @@ def estimate_roc(argv=None):
 
 
 def extract_candidates(argv=None):
+    """
+    运行候选粒子提取。
+
+    参数:
+    argv (list): 命令行参数列表，默认为 None。
+    """
     argv = _parse_argv(argv)
 
-    # entry_point strings cannot use '\n' characters as this will break the website
-    # snippet that displays the CLI help message
+    # entry_point 字符串不能使用 '\n' 字符，因为这会破坏网站上显示 CLI 帮助信息的代码片段
     # ---8<--- [start:extract_candidates_usage]
 
+    # 创建命令行参数解析器
     parser = argparse.ArgumentParser(
         prog="pytom_extract_candidates.py",
         description="Run candidate extraction. -- Marten Chaillet (@McHaillet)",
     )
+    # 添加 -j/--job-file 参数，指定包含模板匹配作业数据的 JSON 文件路径
     parser.add_argument(
         "-j",
         "--job-file",
@@ -447,6 +536,7 @@ def extract_candidates(argv=None):
         help="JSON file that contain all data on the template matching job, written "
         "out by pytom_match_template.py in the destination path.",
     )
+    # 添加 --tomogram-mask 参数，指定用于提取的断层图像掩码文件路径
     parser.add_argument(
         "--tomogram-mask",
         type=pathlib.Path,
@@ -459,6 +549,7 @@ def extract_candidates(argv=None):
         "cellular region. If the job was run with a tomogram mask, this file will be "
         "used instead of the job mask",
     )
+    # 添加 --ignore_tomogram_mask 参数，指定是否忽略输入和 TM 作业的断层图像掩码
     parser.add_argument(
         "--ignore_tomogram_mask",
         action="store_true",
@@ -467,6 +558,7 @@ def extract_candidates(argv=None):
         help="Flag to ignore the input and TM job tomogram mask. Useful if the scores "
         "mrc looks reasonable, but this finds 0 particles to extract",
     )
+    # 添加 -n/--number-of-particles 参数，指定要从断层图像中提取的最大粒子数量
     parser.add_argument(
         "-n",
         "--number-of-particles",
@@ -475,6 +567,7 @@ def extract_candidates(argv=None):
         action=LargerThanZero,
         help="Maximum number of particles to extract from tomogram.",
     )
+    # 添加 --number-of-false-positives 参数，指定用于确定误报率的假阳性数量
     parser.add_argument(
         "--number-of-false-positives",
         type=float,
@@ -488,6 +581,7 @@ def extract_candidates(argv=None):
         "specificity). The value can also be set between 0 and 1 to make "
         "the cut-off more restrictive.",
     )
+    # 添加 --particle-diameter 参数，指定模板的粒子直径
     parser.add_argument(
         "--particle-diameter",
         type=float,
@@ -503,6 +597,7 @@ def extract_candidates(argv=None):
         "determined using its long axis but the extraction mask should use its "
         "short axis.",
     )
+    # 添加 -c/--cut-off 参数，指定覆盖自动提取截止值估计，使用指定的 LCCmax 值进行提取
     parser.add_argument(
         "-c",
         "--cut-off",
@@ -514,6 +609,7 @@ def extract_candidates(argv=None):
         "left in the score map. Values larger than 1 make no sense as the correlation "
         "cannot be higher than 1.",
     )
+    # 添加 --tophat-filter 参数，指定是否尝试使用顶帽变换过滤尖锐的相关峰
     parser.add_argument(
         "--tophat-filter",
         action="store_true",
@@ -521,6 +617,7 @@ def extract_candidates(argv=None):
         required=False,
         help="Attempt to filter only sharp correlation peaks with a tophat transform",
     )
+    # 添加 --tophat-connectivity 参数，指定顶帽变换中使用的 ndimage 二进制结构的内核连通性
     parser.add_argument(
         "--tophat-connectivity",
         type=int,
@@ -532,6 +629,7 @@ def extract_candidates(argv=None):
         "restrictive, 3 the least restrictive. Generally recommended to "
         "leave at 1.",
     )
+    # 添加 --relion5-compat 参数，指定是否以 RELION5 兼容的格式写出居中的坐标
     parser.add_argument(
         "--relion5-compat",
         action="store_true",
@@ -539,6 +637,7 @@ def extract_candidates(argv=None):
         required=False,
         help="Write out centered coordinates in Angstrom for RELION5.",
     )
+    # 添加 --log 参数，指定日志级别
     parser.add_argument(
         "--log",
         type=str,
@@ -547,6 +646,7 @@ def extract_candidates(argv=None):
         action=ParseLogging,
         help="Can be set to `info` or `debug`",
     )
+    # 添加 --tophat-bins 参数，指定顶帽变换代码中直方图的箱数
     parser.add_argument(
         "--tophat-bins",
         type=int,
@@ -556,6 +656,7 @@ def extract_candidates(argv=None):
         help="Number of bins to use in the histogram of occurences in the "
         "tophat transform code (for both the estimation and the plotting).",
     )
+    # 添加 --plot-bins 参数，指定用于绘制出现次数与 LCC_max 关系图的箱数
     parser.add_argument(
         "--plot-bins",
         type=int,
@@ -567,10 +668,12 @@ def extract_candidates(argv=None):
 
     # ---8<--- [end:extract_candidates_usage]
 
+    # 解析命令行参数
     args = parser.parse_args(argv)
+    # 配置日志记录
     logging.basicConfig(level=args.log, force=True)
 
-    # load job and extract particles from the volumes
+    # 加载作业并从体积中提取粒子
     job = load_json_to_tmjob(args.job_file)
     df, _ = extract_particles(
         job,
@@ -587,7 +690,7 @@ def extract_candidates(argv=None):
         plot_bins=args.plot_bins,
     )
 
-    # write out as a RELION type starfile
+    # 将提取结果保存为 RELION 类型的 STAR 文件
     starfile.write(
         {"particles": df},
         job.output_dir.joinpath(f"{job.tomo_id}_particles.star"),
@@ -596,20 +699,28 @@ def extract_candidates(argv=None):
 
 
 def match_template(argv=None):
+    """
+    运行模板匹配。
+
+    参数:
+    argv (list): 命令行参数列表，默认为 None。
+    """
     from pytom_tm.tmjob import TMJob
     from pytom_tm.parallel import run_job_parallel
 
     argv = _parse_argv(argv)
 
-    # entry_point strings cannot use '\n' characters as this will break the website
-    # snippet that displays the CLI help message
+    # entry_point 字符串不能使用 '\n' 字符，因为这会破坏网站上显示 CLI 帮助信息的代码片段
     # ---8<--- [start:match_template_usage]
 
+    # 创建命令行参数解析器
     parser = argparse.ArgumentParser(
         prog="pytom_match_template.py",
         description="Run template matching. -- Marten Chaillet (@McHaillet)",
     )
+    # 创建输入输出相关的参数组
     io_group = parser.add_argument_group("Template, search volume, and output")
+    # 添加 -t/--template 参数，指定模板的 MRC 文件路径
     io_group.add_argument(
         "-t",
         "--template",
@@ -620,6 +731,7 @@ def match_template(argv=None):
         "if the tomogram has black ribosomes, the reference should be black. "
         "(pytom_create_template.py has an option to invert contrast) ",
     )
+    # 添加 -v/--tomogram 参数，指定断层图像的 MRC 文件路径
     io_group.add_argument(
         "-v",
         "--tomogram",
@@ -628,6 +740,7 @@ def match_template(argv=None):
         action=CheckFileExists,
         help="Tomographic volume; MRC file.",
     )
+    # 添加 -d/--destination 参数，指定模板匹配结果文件的存储目录
     io_group.add_argument(
         "-d",
         "--destination",
@@ -637,7 +750,9 @@ def match_template(argv=None):
         action=CheckDirExists,
         help="Folder to store the files produced by template matching.",
     )
+    # 创建掩码相关的参数组
     mask_group = parser.add_argument_group("Mask")
+    # 添加 -m/--mask 参数，指定与模板具有相同盒子大小的掩码 MRC 文件路径
     mask_group.add_argument(
         "-m",
         "--mask",
@@ -646,6 +761,7 @@ def match_template(argv=None):
         action=CheckFileExists,
         help="Mask with same box size as template; MRC file.",
     )
+    # 添加 --non-spherical-mask 参数，指定掩码是否为非球形
     mask_group.add_argument(
         "--non-spherical-mask",
         action="store_true",
@@ -653,7 +769,9 @@ def match_template(argv=None):
         help="Flag to set when the mask is not spherical. It adds the required "
         "computations for non-spherical masks and roughly doubles computation time.",
     )
+    # 创建角度搜索相关的参数组
     rotation_group = parser.add_argument_group("Angular search")
+    # 添加 --particle-diameter 参数，指定粒子直径，用于自动确定角度采样
     rotation_group.add_argument(
         "--particle-diameter",
         type=float,
@@ -665,6 +783,7 @@ def match_template(argv=None):
         "in which case the low-pass resolution is used. For non-globular "
         "macromolecules choose the diameter along the longest axis.",
     )
+    # 添加 --angular-search 参数，指定角度搜索的方式
     rotation_group.add_argument(
         "--angular-search",
         type=str,
@@ -679,6 +798,7 @@ def match_template(argv=None):
         "Angle format is ZXZ anti-clockwise (see: "
         "https://www.ccpem.ac.uk/user_help/rotation_conventions.php).",
     )
+    # 添加 --z-axis-rotational-symmetry 参数，指定模板绕 z 轴的旋转对称性
     rotation_group.add_argument(
         "--z-axis-rotational-symmetry",
         type=int,
@@ -689,7 +809,9 @@ def match_template(argv=None):
         "the z-axis. The length of the rotation search will be shortened through "
         "division by this value. Only works for template symmetry around the z-axis.",
     )
+    # 创建体积控制相关的参数组
     volume_group = parser.add_argument_group("Volume control")
+    # 添加 -s/--volume-split 参数，指定将体积分割成更小部分进行搜索的方式
     volume_group.add_argument(
         "-s",
         "--volume-split",
@@ -701,6 +823,7 @@ def match_template(argv=None):
         "can be relevant if the volume does not fit into GPU memory. "
         "Format is x y z, e.g. --volume-split 1 2 1",
     )
+    # 添加 --search-x 参数，指定沿 x 轴的搜索起始和结束索引
     volume_group.add_argument(
         "--search-x",
         nargs=2,
@@ -710,6 +833,7 @@ def match_template(argv=None):
         help="Start and end indices of the search along the x-axis, "
         "e.g. --search-x 10 490 ",
     )
+    # 添加 --search-y 参数，指定沿 y 轴的搜索起始和结束索引
     volume_group.add_argument(
         "--search-y",
         nargs=2,
@@ -719,6 +843,7 @@ def match_template(argv=None):
         help="Start and end indices of the search along the y-axis, "
         "e.g. --search-x 10 490 ",
     )
+    # 添加 --search-z 参数，指定沿 z 轴的搜索起始和结束索引
     volume_group.add_argument(
         "--search-z",
         nargs=2,
@@ -728,6 +853,7 @@ def match_template(argv=None):
         help="Start and end indices of the search along the z-axis, "
         "e.g. --search-x 30 230 ",
     )
+    # 添加 --tomogram-mask 参数，指定用于匹配的断层图像掩码文件路径
     volume_group.add_argument(
         "--tomogram-mask",
         type=pathlib.Path,
@@ -738,7 +864,9 @@ def match_template(argv=None):
         "will be skipped.",
     )
 
+    # 创建滤波器控制相关的参数组
     filter_group = parser.add_argument_group("Filter control")
+    # 添加 -a/--tilt-angles 参数，指定倾斜系列的倾斜角度
     filter_group.add_argument(
         "-a",
         "--tilt-angles",
@@ -751,6 +879,7 @@ def match_template(argv=None):
         "angles (e.g. --tilt-angles tomo101.rawtlt). In case all the tilt angles are "
         "provided a more elaborate Fourier space constraint can be used",
     )
+    # 添加 --per-tilt-weighting 参数，指定是否激活每个倾斜角度的加权
     filter_group.add_argument(
         "--per-tilt-weighting",
         action="store_true",
@@ -763,6 +892,7 @@ def match_template(argv=None):
         "weighted by cos(tilt_angle). If dose accumulation and CTF parameters are "
         "provided these will all be incorporated in the tilt-weighting.",
     )
+    # 添加 --voxel-size-angstrom 参数，指定断层图像/模板的体素大小
     filter_group.add_argument(
         "--voxel-size-angstrom",
         type=float,
@@ -772,6 +902,7 @@ def match_template(argv=None):
         "try to read from the MRC files. Argument is important for band-pass "
         "filtering!",
     )
+    # 添加 --low-pass 参数，指定对断层图像和模板应用的低通滤波器分辨率
     filter_group.add_argument(
         "--low-pass",
         type=float,
@@ -781,6 +912,7 @@ def match_template(argv=None):
         "if the template was already filtered to a certain resolution. "
         "Value is the resolution in A.",
     )
+    # 添加 --high-pass 参数，指定对断层图像和模板应用的高通滤波器分辨率
     filter_group.add_argument(
         "--high-pass",
         type=float,
@@ -791,6 +923,7 @@ def match_template(argv=None):
         "e.g. 500 could be appropriate as the CTF is often incorrectly modelled "
         "up to 50nm.",
     )
+    # 添加 --dose-accumulation 参数，指定包含每个倾斜角度累积剂量的文件路径
     filter_group.add_argument(
         "--dose-accumulation",
         type=str,
@@ -800,6 +933,7 @@ def match_template(argv=None):
         "tilt angle, assuming the same ordering of tilts as the tilt angle file. "
         "Format should be a .txt file with on each line a dose value in e-/A2.",
     )
+    # 添加 --defocus 参数，指定散焦信息
     filter_group.add_argument(
         "--defocus",
         type=str,
@@ -815,6 +949,7 @@ def match_template(argv=None):
         "you provide this, the input template should not be modulated with a CTF "
         "beforehand. If it is a reconstruction it should ideally be Wiener filtered.",
     )
+    # 添加 --amplitude-contrast 参数，指定 CTF 的振幅对比度
     filter_group.add_argument(
         "--amplitude-contrast",
         type=float,
@@ -822,6 +957,7 @@ def match_template(argv=None):
         action=BetweenZeroAndOne,
         help="Amplitude contrast fraction for CTF.",
     )
+    # 添加 --spherical-aberration 参数，指定 CTF 的球差
     filter_group.add_argument(
         "--spherical-aberration",
         type=float,
@@ -829,6 +965,7 @@ def match_template(argv=None):
         action=LargerThanZero,
         help="Spherical aberration for CTF in mm.",
     )
+    # 添加 --voltage 参数，指定 CTF 的电压
     filter_group.add_argument(
         "--voltage",
         type=float,
@@ -836,6 +973,7 @@ def match_template(argv=None):
         action=LargerThanZero,
         help="Voltage for CTF in keV.",
     )
+    # 添加 --phase-shift 参数，指定 CTF 的相移
     filter_group.add_argument(
         "--phase-shift",
         type=float,
@@ -844,6 +982,7 @@ def match_template(argv=None):
         action=LargerThanZero,
         help="Phase shift (in degrees) for the CTF to model phase plates.",
     )
+    # 添加 --tomogram-ctf-model 参数，指定输入断层图像重建时 CTF 的校正方式
     filter_group.add_argument(
         "--tomogram-ctf-model",
         required=False,
@@ -856,6 +995,7 @@ def match_template(argv=None):
         "phase flipping or reconstructions generated with "
         "novaCTF/3dctf.",
     )
+    # 添加 --defocus-handedness 参数，指定散焦梯度校正的手性
     filter_group.add_argument(
         "--defocus-handedness",
         required=False,
@@ -873,6 +1013,7 @@ def match_template(argv=None):
         "Zianetti (2021)), -1 means the handedness will be inverted. If uncertain "
         "better to leave off as an inverted correction might hamper results.",
     )
+    # 添加 --spectral-whitening 参数，指定是否计算频谱白化滤波器
     filter_group.add_argument(
         "--spectral-whitening",
         action="store_true",
@@ -882,7 +1023,9 @@ def match_template(argv=None):
         "apply it to the tomogram patch and template. Effectively puts more weight on "
         "high resolution features and sharpens the correlation peaks.",
     )
+    # 创建附加选项相关的参数组
     additional_group = parser.add_argument_group("Additional options")
+    # 添加 -r/--random-phase-correction 参数，指定是否同时运行模板的相位随机化版本进行噪声校正
     additional_group.add_argument(
         "-r",
         "--random-phase-correction",
@@ -894,6 +1037,7 @@ def match_template(argv=None):
         "For this method please see STOPGAP as a reference: "
         "https://doi.org/10.1107/S205979832400295X .",
     )
+    # 添加 --half-precision 参数，指定是否以半精度（float16）保存输出
     additional_group.add_argument(
         "--half-precision",
         action="store_true",
@@ -901,15 +1045,17 @@ def match_template(argv=None):
         required=False,
         help="Return and save all output in float16 instead of the default float32",
     )
+    # 添加 --rng-seed 参数，指定随机数生成器的种子
     additional_group.add_argument(
         "--rng-seed",
         type=int,
         action=LargerThanZero,
-        default=int.from_bytes(urandom(8)),
+        default=int.from_bytes(urandom(8), byteorder='little'),
         required=False,
         help="Specify a seed for the random number generator used for phase "
         "randomization for consistent results!",
     )
+    # 添加 --relion5-tomograms-star 参数，指定 RELION5 tomograms.star 文件的路径
     additional_group.add_argument(
         "--relion5-tomograms-star",
         type=pathlib.Path,
@@ -921,7 +1067,9 @@ def match_template(argv=None):
         "the tilt-series metadata from this file and overwrite all other "
         "metadata options.",
     )
+    # 创建设备控制相关的参数组
     device_group = parser.add_argument_group("Device control")
+    # 添加 -g/--gpu-ids 参数，指定运行程序的 GPU 索引
     device_group.add_argument(
         "-g",
         "--gpu-ids",
@@ -931,7 +1079,9 @@ def match_template(argv=None):
         required=True,
         help="GPU indices to run the program on.",
     )
+    # 创建日志/调试相关的参数组
     debug_group = parser.add_argument_group("Logging/debugging")
+    # 添加 --log 参数，指定日志级别
     debug_group.add_argument(
         "--log",
         type=str,
@@ -943,15 +1093,17 @@ def match_template(argv=None):
 
     # ---8<--- [end:match_template_usage]
 
+    # 解析命令行参数
     args = parser.parse_args(argv)
+    # 配置日志记录
     logging.basicConfig(level=args.log, force=True)
 
-    # parse CTF phase correction
+    # 解析 CTF 相位校正
     phase_flip_correction = False
     if args.tomogram_ctf_model is not None and args.tomogram_ctf_model == "phase-flip":
         phase_flip_correction = True
 
-    # combine ctf values to ctf_params list of dicts
+    # 组合 CTF 值到 ctf_params 列表的字典中
     ctf_params = None
     if args.defocus is not None:
         if (
@@ -977,6 +1129,7 @@ def match_template(argv=None):
         ]
 
     if args.relion5_tomograms_star is not None:
+        # 从 RELION5 的 star 文件中解析元数据
         voxel_size, tilt_angles, dose_accumulation, ctf_params, defocus_handedness = (
             parse_relion5_star_data(
                 args.relion5_tomograms_star,
@@ -1004,6 +1157,7 @@ def match_template(argv=None):
             "diameter should be provided to infer the angular search!"
         )
 
+    # 创建 TMJob 对象
     job = TMJob(
         "0",
         args.log,
@@ -1035,11 +1189,12 @@ def match_template(argv=None):
         output_dtype=np.float16 if args.half_precision else np.float32,
     )
 
+    # 并行运行模板匹配作业
     score_volume, angle_volume = run_job_parallel(
         job, tuple(args.volume_split), args.gpu_ids
     )
 
-    # set the appropriate headers when writing!
+    # 设置适当的头信息并写入文件
     write_mrc(
         args.destination.joinpath(f"{job.tomo_id}_scores.mrc"),
         score_volume,
@@ -1051,17 +1206,23 @@ def match_template(argv=None):
         job.voxel_size,
     )
 
-    # write the job as well
+    # 写入作业信息到 JSON 文件
     job.write_to_json(args.destination.joinpath(f"{job.tomo_id}_job.json"))
 
 
 def merge_stars(argv=None):
+    """
+    合并同一目录下的多个 STAR 文件。
+
+    参数:
+    argv (list): 命令行参数列表，默认为 None。
+    """
     import pandas as pd
 
-    # entry_point strings cannot use '\n' characters as this will break the website
-    # snippet that displays the CLI help message
+    # entry_point 字符串不能使用 '\n' 字符，因为这会破坏网站上显示 CLI 帮助信息的代码片段
     # ---8<--- [start:merge_stars_usage]
 
+    # 创建命令行参数解析器
     parser = argparse.ArgumentParser(
         prog="pytom_merge_stars.py",
         description=(
@@ -1069,6 +1230,7 @@ def merge_stars(argv=None):
             "-- Marten Chaillet (@McHaillet)"
         ),
     )
+    # 添加 -i/--input-dir 参数，指定包含 STAR 文件的目录
     parser.add_argument(
         "-i",
         "--input-dir",
@@ -1081,6 +1243,7 @@ def merge_stars(argv=None):
             "script will try to merge all files that end in '.star'."
         ),
     )
+    # 添加 -o/--output-file 参数，指定合并后输出的 STAR 文件名称
     parser.add_argument(
         "-o",
         "--output-file",
@@ -1089,6 +1252,7 @@ def merge_stars(argv=None):
         default="./particles.star",
         help="Output star file name.",
     )
+    # 添加 --log 参数，指定日志级别
     parser.add_argument(
         "--log",
         type=str,
@@ -1100,20 +1264,27 @@ def merge_stars(argv=None):
 
     # ---8<--- [end:merge_stars_usage]
 
+    # 解析命令行参数
     args = parser.parse_args(argv)
+    # 配置日志记录
     logging.basicConfig(level=args.log, force=True)
 
+    # 获取指定目录下所有以 .star 结尾的文件
     files = [f for f in args.input_dir.iterdir() if f.suffix == ".star"]
 
     if len(files) == 0:
-        raise ValueError("No starfiles in directory.")
+        # 如果没有找到 STAR 文件，记录警告信息
+        logging.warning("No star files found in the specified directory.")
+    else:
+        # 读取所有 STAR 文件并合并为一个 DataFrame
+        data_frames = [starfile.read(file)["particles"] for file in files]
+        merged_df = pd.concat(data_frames, ignore_index=True)
 
-    logging.info("Concatting and writing star files")
-
-    dataframes = [starfile.read(f) for f in files]
-
-    starfile.write(
-        {"particles": pd.concat(dataframes, ignore_index=True)},
-        args.output_file,
-        overwrite=True,
-    )
+        # 将合并后的 DataFrame 保存为 STAR 文件
+        starfile.write(
+            {"particles": merged_df},
+            args.output_file,
+            overwrite=True,
+        )
+        # 记录合并成功的信息
+        logging.info(f"Successfully merged {len(files)} star files into {args.output_file}.")

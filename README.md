@@ -148,3 +148,29 @@ Chaillet, M. L., van der Schot, G., Gubins, I., Roet, S., Veltkamp, R. C., & Fö
 This ends the block for the website
 -->
 [//]: # (#--8<-- [end:docs])
+
+
+
+
+# 源码Pytom的安装
+新建Conda环境：
+```commandline
+conda activate pytom_tm
+```
+
+拉取源码，进入源码目录
+```commandline
+git clone https://github.com/SBC-Utrecht/pytom-match-pick.git
+cd pytom-match-pick
+```
+
+安装（二选一）
+一、打包安装 - 源码安装模式
+```commandline
+python -m pip install '.[all]'
+```
+
+二、安装一个 Python 包并保持对源代码的“可编辑”链接 - 开发模式
+```commandline
+pip install -e .
+```
