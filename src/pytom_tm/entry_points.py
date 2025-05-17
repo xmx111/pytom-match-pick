@@ -33,7 +33,9 @@ from pytom_tm.io import (
 from pytom_tm.tmjob import load_json_to_tmjob
 # 从 os 模块导入 urandom 函数，用于生成随机字节
 from os import urandom
-
+import mrcfile
+# 导入tqdm库，用于显示进度条
+from tqdm import tqdm
 
 def _parse_argv(argv=None):
     """
@@ -863,6 +865,15 @@ def match_template(argv=None):
         "equal to the tomogram. If a subvolume only has values <= 0 for this mask it "
         "will be skipped.",
     )
+    # 添加球心列表和内半径系数参数
+    io_group.add_argument(
+        "--sphere-file",
+        dest="sphere_file",
+        type=pathlib.Path,
+        required=False,
+        action=CheckFileExists,
+        help="Path to a text file containing sphere information (x y z rmax), one per line",
+    )
 
     # 创建滤波器控制相关的参数组
     filter_group = parser.add_argument_group("Filter control")
@@ -1175,6 +1186,7 @@ def match_template(argv=None):
         search_y=args.search_y,
         search_z=args.search_z,
         tomogram_mask=args.tomogram_mask,
+        sphere_file=args.sphere_file,
         voxel_size=voxel_size,
         low_pass=args.low_pass,
         high_pass=args.high_pass,
@@ -1288,3 +1300,158 @@ def merge_stars(argv=None):
         )
         # 记录合并成功的信息
         logging.info(f"Successfully merged {len(files)} star files into {args.output_file}.")
+
+def create_mask_from_spheres(sphere_list, volume_shape):
+    """将球体列表转换为掩膜数组。
+
+    参数
+    ----------
+    sphere_list : list[tuple]
+        球体信息列表，每个元素为 (x, y, z, rmin, rmax)
+    volume_shape : tuple
+        MRC文件读取的形状 (z,y,x)
+
+    返回
+    -------
+    mask : np.ndarray
+        二进制掩膜数组，球体内部为1，外部为0
+    """
+    # 创建零数组，注意轴顺序 (z,y,x) -> (x,y,z)
+    mask = np.zeros((volume_shape[2], volume_shape[1], volume_shape[0]), dtype=np.float32)
+    
+    # 对每个球体进行处理
+    for sphere in tqdm(sphere_list, desc="Processing spheres"):
+        # 获取球心坐标和半径
+        cx, cy, cz, rmin, rmax = sphere
+        
+        # 计算搜索范围（添加1个像素的边界）
+        x_min = max(0, int(cx - rmax) - 1)
+        x_max = min(mask.shape[0], int(cx + rmax) + 2)
+        y_min = max(0, int(cy - rmax) - 1)
+        y_max = min(mask.shape[1], int(cy + rmax) + 2)
+        z_min = max(0, int(cz - rmax) - 1)
+        z_max = min(mask.shape[2], int(cz + rmax) + 2)
+        
+        # 只在球体周围的立方体区域内计算距离
+        for x in range(x_min, x_max):
+            for y in range(y_min, y_max):
+                for z in range(z_min, z_max):
+                    dist = np.sqrt((x - cx)**2 + (y - cy)**2 + (z - cz)**2)
+                    if rmin <= dist <= rmax:
+                        mask[x, y, z] = 1
+    
+    return mask
+
+def save_mask_to_mrc(mask, output_path, voxel_size=None):
+    """将掩膜数组保存为MRC文件。
+
+    参数
+    ----------
+    mask : np.ndarray
+        掩膜数组
+    output_path : str or Path
+        输出MRC文件的路径
+    voxel_size : float, optional
+        体素大小，如果提供则设置到MRC文件中
+    """
+    # 在 MRC 文件格式中，通常使用 (z,y,x) 的轴顺序，而我们的计算是在 (x,y,z) 顺序下进行的，所以需要这个转置操作，转换轴顺序 (x,y,z) -> (z,y,x)
+    output_ar = np.transpose(mask, (2,1,0))
+    with mrcfile.new(output_path, overwrite=True) as mrc:
+        mrc.set_data(output_ar)
+        if voxel_size is not None:
+            mrc.voxel_size = voxel_size
+
+def convert_spheres_to_mask(argv = None):
+    """将sphere_list转换为tomogram_mask。
+
+    参数
+    ----------
+    args : argparse.Namespace
+        命令行参数
+    sphere_list : list[tuple]
+        处理好的球体信息列表，每个元素为 (x, y, z, rmin, rmax)
+    """
+    argv = _parse_argv(argv)
+
+    # entry_point 字符串不能使用 '\n' 字符，因为这会破坏网站上显示 CLI 帮助信息的代码片段
+    # ---8<--- [start:match_template_usage]
+
+    # 创建命令行参数解析器
+    parser = argparse.ArgumentParser(
+        prog="pytom_spheres_to_mask.py",
+        description="Convert sphere list to tomogram mask. -- Marten Chaillet (@McHaillet)",
+    )
+    # 创建输入输出相关的参数组
+    io_group = parser.add_argument_group("Template, search volume, and output")
+    # 添加 -v/--tomogram 参数，指定断层图像的 MRC 文件路径
+    io_group.add_argument(
+        "-v",
+        "--tomogram",
+        type=pathlib.Path,
+        required=True,
+        action=CheckFileExists,
+        help="Tomographic volume; MRC file.",
+    )
+    # 添加 -d/--destination 参数，指定掩膜结果文件的存储目录
+    io_group.add_argument(
+        "-d",
+        "--destination",
+        type=pathlib.Path,
+        required=False,
+        default="./",
+        action=CheckDirExists,
+        help="Folder to store the files produced by template matching.",
+    )
+    # 添加球心列表和内半径系数参数
+    io_group.add_argument(
+        "--sphere-list",
+        dest="sphere_list",
+        required=True,
+        type=str,
+        help="Path to a text file containing sphere information (x y z rmax), one per line",
+    )
+    # 创建附加选项相关的参数组
+    additional_group = parser.add_argument_group("Additional options")
+    additional_group.add_argument(
+        "--rmin-factor",
+        dest="rmin_factor",
+        required=False,
+        type=float,
+        default=0.5,
+        help="Factor to calculate inner radius from outer radius (rmin = rmax * factor), default 0.5",
+    )
+    # 解析命令行参数
+    args = parser.parse_args(argv)
+
+    # 处理球心列表
+    sphere_list = None
+    # 如果提供了sphere_list但没有提供tomogram_mask
+    if args.sphere_list is not None:
+        # 读取断层图像获取形状和体素大小
+        with mrcfile.open(args.tomogram) as mrc:
+            volume_shape = mrc.data.shape
+            voxel_size = mrc.voxel_size
+            
+        # 读取球体列表
+        spheres = []
+        with open(args.sphere_list, 'r') as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 4:  # 确保至少有4列数据
+                    x, y, z, rmax = map(float, parts[:4])
+                    # 计算内半径
+                    rmin = rmax * args.rmin_factor
+                    spheres.append((x, y, z, rmin, rmax))
+            if spheres:
+                sphere_list = spheres
+        # 创建掩膜文件路径（在输出目录中）
+        mask_path = args.destination / 'vesicle_mask.mrc'
+        
+        # 创建并保存掩膜
+        mask = create_mask_from_spheres(sphere_list, volume_shape)
+        save_mask_to_mrc(mask, mask_path, voxel_size)
+        
+        # 更新args中的tomogram_mask参数
+        args.tomogram_mask = mask_path
+        
+        print(f"Created mask file from sphere list: {mask_path}")

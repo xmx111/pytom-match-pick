@@ -16,6 +16,15 @@ from tqdm import tqdm
 from pytom_tm.correlation import mean_under_mask, std_under_mask
 # 从pytom_tm.template模块导入phase_randomize_template函数
 from pytom_tm.template import phase_randomize_template
+# 导入 numpy 库并简称为 np，用于数值计算
+import numpy as np
+import numba as nb
+# 从scipy.spatial.transform模块导入Rotation类
+from scipy.spatial.transform import Rotation as R
+import time  # 添加时间模块
+# 添加新的计算
+from pytom_tm.theta_mask_optimized import create_new_mask_from_spheres_optimized
+import mrcfile
 
 
 class TemplateMatchingPlan:
@@ -153,9 +162,14 @@ class TemplateMatchingGPU:
         angle_ids: list[int],
         mask_is_spherical: bool = True,
         wedge: npt.NDArray[float] | None = None,
-        stats_roi: tuple[slice, slice, slice] | None = None,
+        stats_roi: tuple[slice, slice, slice] | npt.NDArray[float] | None = None,
         noise_correction: bool = False,
         rng_seed: int = 321,
+        sphere_list : list[tuple] | None = None,
+        search_origin: list[int] | None = None,
+        search_size: list[int] | None = None,
+        volume_origin_shape: tuple | None = None,
+        mask_volume: npt.NDArray[float] | None = None,
     ):
         """
         初始化模板匹配运行。
@@ -221,8 +235,17 @@ class TemplateMatchingGPU:
             self.stats_roi = stats_roi
         # 是否进行噪声校正
         self.noise_correction = noise_correction
+        # 球心信息
+        self.sphere_list = sphere_list
+        # 分片信息
+        self.search_origin = search_origin
+        self.search_size = search_size
+        # 原搜索体积信息
+        self.volume_origin_shape = volume_origin_shape
+        # 标记了球心区域的（子）体积
+        self.mask_volume = mask_volume
 
-        # 创建模板的“随机噪声”版本
+        # 创建模板的"随机噪声"版本
         # 如果需要噪声校正，则生成相位随机化的模板，否则为None
         shuffled_template = (
             phase_randomize_template(template, rng_seed) if noise_correction else None
@@ -240,8 +263,92 @@ class TemplateMatchingGPU:
 
     def run(self) -> tuple[npt.NDArray[float], npt.NDArray[float], dict]:
         """
-        运行模板匹配作业。
+        运行模板匹配作业。只在 stats_roi 定义的区域内计算，如果使用 tomogram_mask，
+        则只对 mask 内的区域进行计算。
+        图示来说明整个模板匹配过程：
+        1. 初始状态
+        搜索体积 (100x100x100)            模板 (20x20x20)          掩码 (20x20x20)
+        +-----------------------+       +------------+           +------------+
+        |                       |       |            |           |            |
+        |      +--------+       |       |  蛋白质分子 |           |   球形区域  |
+        |      |        |       |       |            |           |            |
+        |      |  细胞质 |       |       +------------+           +------------+
+        |      |        |       |
+        |      +--------+       |
+        |                       |
+        +-----------------------+
 
+        2. 角度迭代（只展示一个角度）
+
+        a. 对掩码进行旋转（如果不是球形）
+            
+            原始掩码                   旋转后的掩码
+            +------------+           +------------+
+            |   O        |           |            |
+            |            |  旋转45°   |     O      |
+            |            |  ------> |            |
+            +------------+           +------------+
+
+        b. 计算局部标准差
+        
+            搜索体积中每个点的标准差（使用掩码区域内的值计算）
+            +------------------------+
+            |   X X X X X X X X X X  |
+            |   X X X X X X X X X X  |
+            |   X X X X X X X X X X  |
+            |   X X X X X X X X X X  |
+            |   X X X X X X X X X X  |
+            +------------------------+
+            其中每个X代表该点在掩码内的标准差值
+
+        c. 旋转模板
+        
+            原始模板                   旋转后的模板
+            +------------+           +------------+
+            |  /\        |           |            |
+            |  \/        |  旋转45°   |    /\      |
+            |            |  ------> |    \/      |
+            +------------+           +------------+
+
+        d. 计算互相关
+        
+            将旋转后的模板放置在搜索体积的每个可能位置，计算归一化互相关
+            +------------------------+
+            |   C C C C C C C C C C  |
+            |   C C C C C C C C C C  |
+            |   C C C C C H C C C C  |
+            |   C C C C C C C C C C  |
+            |   C C C C C C C C C C  |
+            +------------------------+
+            其中C代表相关性值，H代表较高的相关性
+
+        e. 更新最佳分数和角度
+        
+            如果当前相关性高于之前的最高分数，则更新该点的分数和角度
+            分数图                      角度图
+            +------------------------+  +------------------------+
+            |   S S S S S S S S S S  |  |   A A A A A A A A A A  |
+            |   S S S S S S S S S S  |  |   A A A A A A A A A A  |
+            |   S S S S S H S S S S  |  |   A A A A A 45 A A A A |
+            |   S S S S S S S S S S  |  |   A A A A A A A A A A  |
+            |   S S S S S S S S S S  |  |   A A A A A A A A A A  |
+            +------------------------+  +------------------------+
+
+        3. 重复步骤2，迭代所有角度
+
+        4. 最终结果（示例）
+
+        分数图 (XY视图)                  角度图 (XY视图)
+        +------------------------+  +------------------------+
+        |   L L L L L L L L L L  |  |   * * * * * * * * * *  |
+        |   L L M M M M M L L L  |  |   * * 30 45 60 * * * *  |
+        |   L M M H H H M M L L  |  |   * * 20 30 30 * * * *  |
+        |   L L M M M M M L L L  |  |   * * 45 60 90 * * * *  |
+        |   L L L L L L L L L L  |  |   * * * * * * * * * *  |
+        +------------------------+  +------------------------+
+        
+        L=低分数, M=中等分数, H=高分数  数字=角度ID, *=任意角度
+        -------
         返回
         -------
         results: tuple[npt.NDArray[float], npt.NDArray[float], dict]
@@ -257,6 +364,14 @@ class TemplateMatchingGPU:
         print(f"Progress job_{self.job_id} on device {self.device_id:d}:")
 
         # 模板的尺寸和中心坐标
+        # 示例：
+        # 如果模板大小为 [20, 20, 20]，则：
+        # sxt = syt = szt = 20 (尺寸)
+        # cxt = cyt = czt = 10 (中心坐标)
+        # mx = my = mz = 0 (偶数尺寸)
+        # 如果搜索体积大小为 [100, 100, 100]，则：
+        # sxv = syv = szv = 100
+        # cxv = cyv = czv = 50
         sxt, syt, szt = self.plan.template.shape
         cxt, cyt, czt = sxt // 2, syt // 2, szt // 2
         # 模板尺寸的奇偶性
@@ -267,6 +382,11 @@ class TemplateMatchingGPU:
         cxv, cyv, czv = sxv // 2, syv // 2, szv // 2
 
         # 创建用于填充的切片
+        # 示例：
+        # 如果模板中心是 [10, 10, 10]，搜索体积中心是 [50, 50, 50]，且模板大小为偶数：
+        # pad_index = (slice(40, 60), slice(40, 60), slice(40, 60))
+        # 如果模板大小有奇数维度，比如 [21, 20, 20]，则：
+        # pad_index = (slice(40, 61), slice(40, 60), slice(40, 60))
         pad_index = (
             slice(cxv - cxt, cxv + cxt + mx),
             slice(cyv - cyt, cyv + cyt + my),
@@ -274,18 +394,28 @@ class TemplateMatchingGPU:
         )
 
         # 计算感兴趣区域的掩码
-        # 计算偏移量
+        # 示例：
+        # 如果 stats_roi = (slice(20, 40), slice(20, 40), slice(20, 40))，则只有这个立方体区域内的点会被设为 True，其余点为 False
+         # 计算偏移量
         shift = cp.floor(cp.array(self.plan.scores.shape) / 2).astype(int) + 1
         # 创建初始掩码
-        roi_mask = cp.zeros(self.plan.scores.shape, dtype=bool)
-        # 设置感兴趣区域为True
-        roi_mask[self.stats_roi] = True
+        if isinstance(self.stats_roi, (np.ndarray, cp.ndarray)):
+            # 如果stats_roi是数组，直接将其转换为cupy布尔数组
+            roi_mask = cp.asarray(self.stats_roi > 0, dtype=bool)
+        else:
+            # 原始逻辑：如果stats_roi是切片或None
+            roi_mask = cp.zeros(self.plan.scores.shape, dtype=bool)
+            if self.stats_roi is not None:
+                roi_mask[self.stats_roi] = True
+            else:
+                roi_mask[:] = True
         # 翻转并滚动掩码
         roi_mask = cp.flip(cp.roll(roi_mask, -shift, (0, 1, 2)))
         # 计算感兴趣区域的大小
         roi_size = self.plan.scores[roi_mask].size
 
         # 如果掩码是球形的，则只需要计算一次局部标准差
+        # 球形掩码的优势：对于球形掩码，无论旋转如何，形状不变，所以只需计算一次标准差，可以节省大量计算时间。
         if self.mask_is_spherical:
             # 将掩码填充到指定位置
             self.plan.mask_padded[pad_index] = self.plan.mask
@@ -301,11 +431,42 @@ class TemplateMatchingGPU:
             )
 
         # 使用tqdm进度条跟踪迭代
+        # 示例：
+        # 如果 angle_list = [(0,0,0), (0,0,45), (0,45,0), ...]
+        # 则循环中 rotation 依次为 (0,0,0), (0,0,45), ...
         for i in tqdm(range(len(self.angle_ids))):
             # 获取角度ID和旋转角度
             angle_id, rotation = self.angle_ids[i], self.angle_list[i]
 
+            sphere_list_mask = None
+            # 如果有球心数据，处理扇形范围
+            if self.sphere_list is not None:
+                sphere_list_mask = create_new_mask_from_spheres_optimized(
+                    sphere_mask=self.mask_volume,
+                    sphere_list=self.sphere_list,
+                    volume_shape=self.volume_origin_shape,
+                    theta=rotation,
+                    search_origin=self.search_origin,
+                    search_size=self.search_size,
+                    delta_theta=np.pi/4,
+                    theta_unit='rad',
+                    rotation_order='rzxz'
+                )
+                # 将numpy数组转换为cupy数组，然后再翻转和滚动
+                sphere_list_mask_cp = cp.asarray(sphere_list_mask, dtype=bool)
+                # 翻转并滚动掩码
+                roi_mask = cp.flip(cp.roll(sphere_list_mask_cp, -shift, (0, 1, 2)))
+                # 计算感兴趣区域的大小
+                roi_size = cp.sum(roi_mask).item()  # 使用cp.sum替代索引计算
+                
+                # # 输出sphere_list_mask到MRC文件
+                # np.transpose(sphere_list_mask, (2,1,0))
+                # with mrcfile.new('sphere_list_mask.mrc', overwrite=True) as mrc:
+                #     mrc.set_data(sphere_list_mask.astype(np.float32))
+            
             # 如果掩码不是球形的，则需要为每个旋转重新计算局部标准差
+            # 非球形掩码的例子：
+            # 例如对于一个扁平的圆盘形掩码，不同旋转角度下掩码覆盖的区域不同，所以每次旋转都需要重新计算标准差。
             if not self.mask_is_spherical:
                 # 旋转掩码
                 self.plan.mask_texture.transform(
@@ -334,20 +495,29 @@ class TemplateMatchingGPU:
                 output=self.plan.template,
                 rotation_units="rad",
             )
+            
+            # 输出template到MRC文件
+            np.transpose(self.plan.template, (2,1,0))
+            with mrcfile.new('template.mrc', overwrite=True) as mrc:
+                mrc.set_data(cp.asnumpy(self.plan.template).astype(np.float32))
 
             # 进行相关性计算
             self.correlate(pad_index)
 
             # 更新分数和角度列表
+            # 使用 CUDA 内核函数更新结果，示例：
+            # 如果在某点，当前角度的相关性为0.8，而之前最高分数是0.7，则更新该点的分数为0.8，角度为当前角度ID
+            # 如果当前相关性为0.6，低于之前的0.7，则保持原值不变
             update_results_kernel(
                 self.plan.scores,
-                self.plan.ccc_map,
+                self.plan.ccc_map * roi_mask,
                 angle_id,
                 self.plan.scores,
                 self.plan.angles,
             )
 
             # 累加相关性系数图的方差
+            # 计算当前角度下相关性图（仅在ROI区域内）的平方和，累加到方差统计中。这对于评估搜索结果的质量很有用。
             self.stats["variance"] += (
                 square_sum_kernel(self.plan.ccc_map * roi_mask) / roi_size
             )
@@ -380,9 +550,9 @@ class TemplateMatchingGPU:
             ) + self.plan.noise_scores.mean()
 
         # 恢复正确的方向
-        # 使用与William Wan的STOPGAP相同的方法：
-        # 搜索体积在迭代前进行了傅里叶变换和共轭，这意味着最终的分数图需要翻转回来。
-        # 由于傅里叶空间相关性函数的ftshift效应，图也需要滚动。
+        # 这段代码：
+        # 对分数和角度图进行翻转和滚动，恢复正确的空间方向
+        # 计算最终的统计信息：搜索空间大小、方差和标准差
         self.plan.scores = cp.roll(cp.flip(self.plan.scores), shift, axis=(0, 1, 2))
         self.plan.angles = cp.roll(cp.flip(self.plan.angles), shift, axis=(0, 1, 2))
 
@@ -394,6 +564,7 @@ class TemplateMatchingGPU:
         self.stats["std"] = float(cp.sqrt(self.stats["variance"]))
 
         # 将结果打包回CPU
+        # 最后，将结果从GPU内存转移到CPU内存，清理GPU资源，并返回结果元组。
         results = (self.plan.scores.get(), self.plan.angles.get(), self.stats)
 
         # 清除所有使用的GPU内存
@@ -410,7 +581,12 @@ class TemplateMatchingGPU:
         padding_index: tuple[slice, slice, slice]
             加权和归一化后填充模板的位置
         """
+        
         # 如果提供了楔形权重
+        # 如果提供了楔形权重（通常用于处理缺失楔形问题），将其应用于模板。这是在傅里叶空间中完成的，通过：
+        # 将模板转换到傅里叶空间 (rfftn)
+        # 乘以楔形权重
+        # 转换回实空间 (irfftn)
         if self.plan.wedge is not None:
             # 在旋转后将楔形权重应用于模板
             self.plan.template = irfftn(
@@ -518,3 +694,150 @@ square_sum_kernel = cp.ReductionKernel(
     "0",  # 单位值
     "variance",  # 内核名称
 )
+
+def create_new_mask_from_spheres_optimized_self(
+    sphere_list, 
+    volume_shape, 
+    theta,  # 现在假设theta是rzxz旋转顺序和弧度单位
+    search_origin,
+    search_size,
+    delta_theta=np.pi/4,  # 默认值改为弧度单位，pi/4 = 45度
+    theta_unit='rad',  # 改为rad作为默认单位
+    rotation_order='rzxz'  # 改为rzxz作为默认旋转顺序
+):
+    
+    # 如果传入角度单位，转换为弧度
+    if theta_unit == 'deg':
+        delta_theta = np.deg2rad(delta_theta)
+        theta = np.deg2rad(theta)
+    
+    # 计算主方向向量 - 使用rzxz顺序和弧度单位
+    # scipy.spatial.transform.Rotation中，'zxz'相当于'rzxz'
+    rot = R.from_euler('zxz', theta)
+    direction = rot.apply(np.array([0, 0, 1]))
+    
+    # 初始化掩码
+    mask = np.zeros(volume_shape, dtype=np.float32)
+    
+    # Numba加速的核心函数
+    @nb.njit(parallel=True)
+    def process_spheres(mask, spheres, direction, delta_theta):
+        # 遍历每个球
+        for s in range(len(spheres)):
+            cx, cy, cz, rmin, rmax = spheres[s]
+            
+            # 限制处理区域
+            x_min = max(0, int(cx - rmax) - 1)
+            x_max = min(mask.shape[0], int(cx + rmax) + 2)
+            y_min = max(0, int(cy - rmax) - 1)
+            y_max = min(mask.shape[1], int(cy + rmax) + 2)
+            z_min = max(0, int(cz - rmax) - 1)
+            z_max = min(mask.shape[2], int(cz + rmax) + 2)
+            
+            # 并行处理x维度
+            for x in nb.prange(x_min, x_max):
+                for y in range(y_min, y_max):
+                    for z in range(z_min, z_max):
+                        # 计算向量和距离
+                        vx = x - cx
+                        vy = y - cy
+                        vz = z - cz
+                        dist_sq = vx*vx + vy*vy + vz*vz
+                        dist = np.sqrt(dist_sq)
+                        
+                        # 检查是否在球壳范围内
+                        if rmin <= dist <= rmax and dist > 0:
+                            # 计算与方向向量的夹角
+                            dot_product = (vx*direction[0] + vy*direction[1] + vz*direction[2]) / dist
+                            # 防止数值误差
+                            if dot_product > 1.0:
+                                dot_product = 1.0
+                            elif dot_product < -1.0:
+                                dot_product = -1.0
+                                
+                            alpha = np.arccos(dot_product)
+                            # 检查是否在角度范围内
+                            if alpha <= delta_theta:
+                                mask[x, y, z] = 1.0
+        return mask
+    
+    # 将spheres列表转换为numba兼容的数组
+    spheres_array = np.array(sphere_list)
+    
+    # 调用加速函数 - 耗时高 2s 左右
+    mask = process_spheres(mask, spheres_array, direction, delta_theta)
+    
+    # 分片返回
+    result = mask[
+        search_origin[0] : search_origin[0] + search_size[0],
+        search_origin[1] : search_origin[1] + search_size[1],
+        search_origin[2] : search_origin[2] + search_size[2],
+    ]
+    
+    non_zero_count = np.count_nonzero(result)
+    
+    return result
+
+# if __name__ == "__main__":
+#     # 从 pytom_tm.io 模块导入多个函数和异常类，用于文件输入输出
+#     from pytom_tm.io import read_mrc_meta_data, read_mrc, write_mrc, UnequalSpacingError
+#     import mrcfile
+#     """测试球壳掩码生成函数"""
+#     # 1. 读取体积文件获取形状
+#     volume_path = "d:/work/my/wyj/match-pick/pytom-match-pick/tests/newdata/Position_50_2_6.24Apx.mrc"
+#     print(f"读取体积文件: {volume_path}")
+#     try:
+#         volume = read_mrc(volume_path)
+#         print(f"体积形状: {volume.shape}")
+#         volume_shape = volume.shape
+#     except Exception as e:
+#         print(f"体积读取失败: {e}")
+#         sys.exit(1)
+
+#     # 2. 设置参数
+#     sphere_list_file = "d:/work/my/wyj/match-pick/pytom-match-pick/tests/newdata/metadata/vesicles.txt"
+    
+#     # 读取球心列表
+#     sphere_list = []
+#     with open(sphere_list_file, 'r') as f:
+#         for line in f:
+#             parts = line.strip().split()
+#             if len(parts) >= 4:
+#                 x, y, z, rmax = map(float, parts[:4])
+#                 rmin = rmax * 0.5
+#                 sphere_list.append((x, y, z, rmin, rmax))
+
+#     theta = (45, 0, 0)  # 欧拉角
+#     delta_theta = 45    # 角度范围
+
+#     # 使用完整的体积大小
+#     search_origin = (0, 0, 0)
+#     search_size = volume_shape
+
+#     # 3. 调用函数
+#     print("生成球壳掩码...")
+#     try:
+#         mask = create_new_mask_from_spheres_optimized_self(
+#             sphere_list=sphere_list,
+#             volume_shape=volume_shape,
+#             theta=theta,
+#             search_origin=search_origin,
+#             search_size=search_size,
+#             delta_theta=delta_theta,
+#             theta_unit='deg',
+#             euler_order='zyx'
+#         )
+#         print(f"掩码生成成功，形状: {mask.shape}")
+
+#         # 4. 保存掩码为MRC文件
+#         output_path = "d:/work/my/wyj/match-pick/pytom-match-pick/tests/output/sphere_mask_test.mrc"
+
+#         output_ar = np.transpose(mask, (2,1,0))
+#         with mrcfile.new(output_path, overwrite=True) as mrc:
+#             mrc.set_data(output_ar)
+#         print(f"已保存掩码为MRC文件: {output_path}")
+#     except Exception as e:
+#         print(f"掩码生成失败: {e}")
+#         import traceback
+#         traceback.print_exc()
+#         sys.exit(1)

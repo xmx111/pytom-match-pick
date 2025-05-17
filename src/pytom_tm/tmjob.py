@@ -36,6 +36,8 @@ from pytom_tm.io import read_mrc_meta_data, read_mrc, write_mrc, UnequalSpacingE
 # 从 pytom_tm 模块导入版本号
 from pytom_tm import __version__ as PYTOM_TM_VERSION
 
+import os
+from datetime import datetime
 
 def load_json_to_tmjob(
     file_name: pathlib.Path, load_for_extraction: bool = True
@@ -301,6 +303,7 @@ class TMJob:
         search_y: list[int, int] | None = None,
         search_z: list[int, int] | None = None,
         tomogram_mask: pathlib.Path | None = None,
+        sphere_file: pathlib.Path | None = None,
         voxel_size: float | None = None,
         low_pass: float | None = None,
         high_pass: float | None = None,
@@ -350,6 +353,8 @@ class TMJob:
             限制断层图像在 z 轴上的搜索区域
         tomogram_mask: Optional[pathlib.Path], 默认值为 None
             当分割断层图像体积时，仅生成掩码中存在大于 0 的值的子任务
+        sphere_file: Optional[pathlib.Path], 默认值为 None
+            标志的球心文件
         voxel_size: Optional[float], 默认值为 None
             断层图像和模板的体素大小（以埃为单位），如果未提供，将从模板/断层图像 MRC 文件中读取
         low_pass: Optional[float], 默认值为 None
@@ -469,8 +474,22 @@ class TMJob:
         ]
 
         logging.debug(f"起始位置，大小 = {self.search_origin}, {self.search_size}")
+
+        self.sphere_list = None
+        if sphere_file is not None:
+            # 传入球心文件并读取
+            self.sphere_list = []
+            with open(sphere_file, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 4:
+                        x, y, z, rmax = map(float, parts[:4])
+                        rmin = rmax * 0.5
+                        self.sphere_list.append((x, y, z, rmin, rmax))
+        
         self.tomogram_mask = tomogram_mask
-        if tomogram_mask is not None:
+        self.has_tomogram_mask = tomogram_mask is not None
+        if self.has_tomogram_mask:
             # 读取断层图像掩码
             temp = read_mrc(tomogram_mask)
             if temp.shape != self.tomo_shape:
@@ -497,7 +516,9 @@ class TMJob:
         self.rotational_symmetry = rotational_symmetry
         self.particle_diameter = particle_diameter
         # 根据粒子直径计算角度增量
+        # angle_increment 7.00
         if angle_increment is None:
+            # particle_diameter "LH1RC": 140, "LH2": 80
             if particle_diameter is not None:
                 # 计算最大分辨率
                 max_res = max(
@@ -898,15 +919,15 @@ class TMJob:
         )
 
         # 加载（子）体积
-        search_volume[
-            : self.search_size[0], : self.search_size[1], : self.search_size[2]
-        ] = np.ascontiguousarray(
-            read_mrc(self.tomogram)[
+        volume_mrc = read_mrc(self.tomogram)
+        volume_mrc_part = volume_mrc[
                 self.search_origin[0] : self.search_origin[0] + self.search_size[0],
                 self.search_origin[1] : self.search_origin[1] + self.search_size[1],
                 self.search_origin[2] : self.search_origin[2] + self.search_size[2],
             ]
-        )
+        search_volume[
+            : self.search_size[0], : self.search_size[1], : self.search_size[2]
+        ] = np.ascontiguousarray(volume_mrc_part)
 
         # 加载模板和掩码
         template, mask = (read_mrc(self.template), read_mrc(self.mask))
@@ -1014,12 +1035,33 @@ class TMJob:
             slice(self.start_slice, self.n_rotations, self.steps_slice)
         ]
 
-        # 用于任务统计的相关部分的切片
-        search_volume_roi = (
-            slice(self.sub_start[0], self.sub_start[0] + self.sub_step[0]),
-            slice(self.sub_start[1], self.sub_start[1] + self.sub_step[1]),
-            slice(self.sub_start[2], self.sub_start[2] + self.sub_step[2]),
-        )
+        mask_volume = None
+        # 加载标记了区域的（子）体积
+        if self.tomogram_mask is not None:
+            # 创建一个零数组，用于存储搜索体积
+            mask_volume = np.zeros(
+                tuple([next_fast_len(s, real=True) for s in self.search_size]),
+                dtype=np.float32,
+            )
+            # 加载标记的（子）体积
+            mask_volume[
+                : self.search_size[0], : self.search_size[1], : self.search_size[2]
+            ] = np.ascontiguousarray(
+                read_mrc(self.tomogram_mask)[
+                    self.search_origin[0] : self.search_origin[0] + self.search_size[0],
+                    self.search_origin[1] : self.search_origin[1] + self.search_size[1],
+                    self.search_origin[2] : self.search_origin[2] + self.search_size[2],
+                ]
+            )
+            search_volume = search_volume * mask_volume
+            search_volume_roi = mask_volume
+        else:
+            # 用于任务统计的相关部分的切片
+            search_volume_roi = (
+                slice(self.sub_start[0], self.sub_start[0] + self.sub_step[0]),
+                slice(self.sub_start[1], self.sub_start[1] + self.sub_step[1]),
+                slice(self.sub_start[2], self.sub_start[2] + self.sub_step[2]),
+            )
 
         # 创建 TemplateMatchingGPU 实例
         tm = TemplateMatchingGPU(
@@ -1035,6 +1077,11 @@ class TMJob:
             stats_roi=search_volume_roi,
             noise_correction=self.random_phase_correction,
             rng_seed=self.rng_seed,
+            sphere_list=self.sphere_list,
+            search_origin=self.search_origin,
+            search_size=self.search_size,
+            volume_origin_shape=volume_mrc.shape,
+            mask_volume=mask_volume
         )
         # 运行模板匹配任务
         results = tm.run()

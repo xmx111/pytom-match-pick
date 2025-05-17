@@ -79,10 +79,8 @@ def run_job_parallel(
     unittest_mute: bool = False,
 ) -> tuple[npt.NDArray[float], npt.NDArray[float]]:
     """
-    在单个或多个 GPU 上并行运行一个任务。如果未提供 volume_splits，
-    则通过分割角度搜索来并行化搜索。如果提供了 volume_splits，
-    任务将首先按体积分割，如果还有更多可用的 GPU，子体积任务将进一步按角度搜索分割。
-
+    在单个或多个 GPU 上并行运行一个任务。考虑 tomogram_mask 来优化搜索。
+    
     参数
     ----------
     main_job: pytom_tm.tmjob.TMJob
@@ -113,15 +111,32 @@ def run_job_parallel(
             # 如果只有一个 GPU，将整个任务添加到任务列表
             jobs.append(main_job)
     elif n_pieces > 1:
+        # 先按体积分割任务
+        volume_jobs = main_job.split_volume_search(volume_splits)
+        
+        # 如果使用了 tomogram_mask，需要检查每个子任务是否有有效区域
+        if main_job.has_tomogram_mask:
+            # 移除没有有效区域的子任务
+            volume_jobs = [j for j in volume_jobs if j is not None]
+        
+        # 如果没有有效的子任务，返回空结果
+        if not volume_jobs:
+            # 创建空的结果数组
+            empty_shape = main_job.data.shape
+            return (
+                np.zeros(empty_shape, dtype=np.float32),
+                np.zeros(empty_shape, dtype=np.float32)
+            )
+        
         # 计算每个子体积任务的角度搜索分割因子
-        rotation_split_factor = len(gpu_ids) // n_pieces
+        rotation_split_factor = max(1, len(gpu_ids) // len(volume_jobs))
         if rotation_split_factor >= 2:
-            # 如果分割因子大于等于 2，对每个子体积任务进一步按角度搜索分割
-            for j in main_job.split_volume_search(volume_splits):
+            # 对每个子体积任务进一步按角度搜索分割
+            for j in volume_jobs:
                 jobs += j.split_rotation_search(rotation_split_factor)
         else:
-            # 否则，仅按体积分割任务
-            jobs = main_job.split_volume_search(volume_splits)
+            # 仅按体积分割任务
+            jobs = volume_jobs
     else:
         # 如果分割块数无效，抛出异常
         raise ValueError("Invalid number of pieces in split volume")
